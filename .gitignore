@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Checkpoints and Models
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Data
+Sample_Data/
+*.png
+*.jpg
+*.jpeg
+
+# Logs and temp files
+*.log
+test_processor.py
+check_token_count.py
+check_dataset_img.py
+test_inference.py
+
+# Environment
+.env
+venv/
+env/
