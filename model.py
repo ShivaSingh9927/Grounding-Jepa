@@ -17,11 +17,12 @@ class GroundingJepa(nn.Module):
                  qwen_model_id='Qwen/Qwen2.5-VL-7B-Instruct',
                  device='cuda',
                  freeze_observer=True,
-                 use_lora=True):
+                 use_lora=True,
+                 jepa_checkpoint_path=None):
         super().__init__()
         
         # 1. The Observer
-        self.observer = IJepaObserver(model_id=ijepa_model_id, device=device)
+        self.observer = IJepaObserver(model_id=ijepa_model_id, device=device, checkpoint_path=jepa_checkpoint_path)
         if freeze_observer:
             print("Freezing Observer (I-JEPA)")
             for param in self.observer.parameters():

@@ -1,18 +1,19 @@
 import os
 import json
 import torch
+import random
+import numpy as np
+import wandb
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
 from model import GroundingJepa
 from tqdm import tqdm
+from eval_utils import get_clinical_metrics
 
 class GroundingDataset(Dataset):
-    def __init__(self, jsonl_path, image_dir, tokenizer, processor, image_processor):
-        self.data = []
-        with open(jsonl_path, 'r') as f:
-            for line in f:
-                self.data.append(json.loads(line))
+    def __init__(self, data_list, image_dir, tokenizer, processor, image_processor):
+        self.data = data_list
         self.image_dir = image_dir
         self.tokenizer = tokenizer
         self.processor = processor
@@ -35,90 +36,43 @@ class GroundingDataset(Dataset):
         # Use observer's image processor
         pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0)
 
-        # Robust extraction of question and answer
-        out = item.get('structured_output', {})
-        question = ""
-        answer = ""
+        # Extraction logic
+        question = item.get('question', "")
+        answer = item.get('answer', "")
 
-        # Priority 1: REC_QUESTION / REC_ANSWER
-        if 'REC_QUESTION' in out:
-            question = out['REC_QUESTION']
-            answer = out.get('REC_ANSWER', "")
-        # Priority 2: REC QUESTION / REC ANSWER (space instead of underscore)
-        elif 'REC QUESTION' in out:
-            question = out['REC QUESTION']
-            answer = out.get('REC ANSWER', out.get('ANSWER', ""))
-        # Priority 3: REC as dict or list
-        elif 'REC' in out:
-            rec = out['REC']
-            if isinstance(rec, list) and len(rec) > 0:
-                question = rec[0].get('question', "")
-                answer = rec[0].get('answer', "")
-            elif isinstance(rec, dict):
-                question = rec.get('question', "")
-                answer = rec.get('answer', "")
-            elif isinstance(rec, str):
-                # Handle "Question: ... Answer: ..." string if present
-                question = rec
-                answer = out.get('ANSWER', "")
-        # Priority 4: REC QUESTION AND ANSWER
-        elif 'REC QUESTION AND ANSWER' in out:
-            qa = out['REC QUESTION AND ANSWER']
-            question = qa.get('question', "")
-            answer = qa.get('answer', "")
-        # Priority 5: REPORT_QUESTION_ANSWER
-        elif 'REPORT_QUESTION_ANSWER' in out:
-            qa = out['REPORT_QUESTION_ANSWER']
-            question = qa.get('question', "")
-            answer = qa.get('answer', "")
-        # Fallback
-        else:
-            question = out.get('QUESTION', "Describe the chest X-ray.")
-            answer = out.get('ANSWER', "The chest X-ray appears normal.")
+        if not question or not answer:
+            out = item.get('structured_output', {})
+            if 'REC_QUESTION' in out:
+                question = out['REC_QUESTION']
+                answer = out.get('REC_ANSWER', "")
+            elif 'REC QUESTION' in out:
+                question = out['REC QUESTION']
+                answer = out.get('REC ANSWER', out.get('ANSWER', ""))
+            else:
+                question = out.get('QUESTION', "Describe the chest X-ray.")
+                answer = out.get('ANSWER', "The chest X-ray appears normal.")
 
-        # Clean strings (remove prefixes like "Question: " if they exist)
         question = question.replace("Question: ", "").strip()
         answer = answer.replace("Answer: ", "").strip()
         
-        # Use processor to format prompt correctly for both user and assistant parts
+        # Training format (Chat template)
         messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": question},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": answer},
-                ],
-            }
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]},
+            {"role": "assistant", "content": [{"type": "text", "text": answer}]}
         ]
         
-        prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
+        prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         
-        # 10. Processor needs a 224x224 image to generate exactly 64 vision tokens (8x8 grid)
-        # to match our JEPA+Bridge output.
         image_for_processor = image.resize((224, 224))
         
-        # Use processor instead of tokenizer to properly expand vision pads (64 for 224x224)
         inputs = self.processor(
             text=[prompt],
             images=[image_for_processor],
             return_tensors="pt",
             padding="max_length",
-            truncation=False, # Disable truncation here to avoid token count errors
+            truncation=True,
             max_length=768
         )
-
-        # Truncate manually if necessary to avoid the error
-        if inputs.input_ids.shape[1] > 768:
-            inputs.input_ids = inputs.input_ids[:, :768]
-            inputs.attention_mask = inputs.attention_mask[:, :768]
 
         labels = inputs.input_ids.clone()
         
@@ -127,73 +81,156 @@ class GroundingDataset(Dataset):
             "input_ids": inputs.input_ids.squeeze(0),
             "attention_mask": inputs.attention_mask.squeeze(0),
             "image_grid_thw": inputs.image_grid_thw.squeeze(0),
-            "labels": labels.squeeze(0)
+            "labels": labels.squeeze(0),
+            "raw_image": image_for_processor, # Keep for visualization if needed
+            "raw_question": question,
+            "raw_answer": answer
         }
+
+def custom_collate(batch):
+    keys = batch[0].keys()
+    collated = {}
+    for key in keys:
+        if key in ["images", "input_ids", "attention_mask", "image_grid_thw", "labels"]:
+            collated[key] = torch.stack([item[key] for item in batch])
+        else:
+            collated[key] = [item[key] for item in batch]
+    return collated
+
+def evaluate(model, dataloader, device, max_samples=100):
+    model.eval()
+    predictions = []
+    ground_truths = []
+    
+    # We limit validation samples for speed during training if desired
+    # For a full epoch end, we use more.
+    count = 0
+    print("Running Validation...")
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            if count >= max_samples:
+                break
+                
+            images = batch['images'].to(device, dtype=torch.bfloat16)
+            image_grid_thw = batch['image_grid_thw'].to(device)
+            # For generation, we use the reasoning prompt (User only)
+            
+            for i in range(len(batch['raw_question'])):
+                if count >= max_samples: break
+                
+                # Single sample inference
+                img = batch['raw_image'][i]
+                prompt = batch['raw_question'][i]
+                gt = batch['raw_answer'][i]
+                
+                # We can call model.predict_grounding directly but we already have pixels
+                # Let's use a optimized version here
+                pixel_values = images[i].unsqueeze(0)
+                grid_thw = image_grid_thw[i].unsqueeze(0)
+                
+                messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+                gen_prompt = model.reasoner.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                
+                inputs = model.reasoner.processor(text=[gen_prompt], images=[img], return_tensors="pt").to(device)
+                
+                outputs = model.reasoner.generate_answer(
+                    input_ids=inputs.input_ids,
+                    images=pixel_values,
+                    image_grid_thw=grid_thw,
+                    attention_mask=inputs.attention_mask
+                )
+                
+                pred_text = model.reasoner.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                predictions.append(pred_text)
+                ground_truths.append(gt)
+                count += 1
+                
+    metrics = get_clinical_metrics(predictions, ground_truths)
+    model.train()
+    return metrics
 
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    
+    # Initialize W&B
+    wandb.init(project="grounding-jepa-xray", name="clinical-metrics-run-1")
 
     # 1. Initialize Model
     model = GroundingJepa(
         ijepa_model_id='jmtzt/ijepa_vitg16_22k',
         device=device,
         freeze_observer=True,
-        use_lora=True
+        use_lora=True,
+        jepa_checkpoint_path='/nuvodata/User_data/shiva/Grounding-Jepa/weights/jepa_xray_vitg16.pth.tar'
     ).to(device)
-
-    # Convert model to bfloat16 for efficiency
     model.to(dtype=torch.bfloat16)
 
-    # 2. Setup Dataset
-    dataset = GroundingDataset(
-        jsonl_path="/nuvodata/User_data/shiva/Grounding-Jepa/Sample_Data/structured_medgemma_results.jsonl",
-        image_dir="/nuvodata/User_data/shiva/Grounding-Jepa/Sample_Data/images",
+    # 2. Setup Data Split (Image-ID aware)
+    jsonl_path = "/nuvodata/User_data/shiva/Grounding-Jepa/data/medgemma_clean_qa.jsonl"
+    all_data = []
+    with open(jsonl_path, 'r') as f:
+        for line in f:
+            all_data.append(json.loads(line))
+            
+    # Unique IDs
+    unique_ids = list(set([item['image_id'] for item in all_data]))
+    random.seed(42)
+    random.shuffle(unique_ids)
+    
+    split_idx = int(0.8 * len(unique_ids))
+    train_ids = set(unique_ids[:split_idx])
+    val_ids = set(unique_ids[split_idx:])
+    
+    train_data = [d for d in all_data if d['image_id'] in train_ids]
+    val_data = [d for d in all_data if d['image_id'] in val_ids]
+    
+    print(f"Dataset Split: {len(train_data)} train, {len(val_data)} val ({len(unique_ids)} unique images)")
+
+    train_dataset = GroundingDataset(
+        data_list=train_data,
+        image_dir="/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train",
         tokenizer=model.reasoner.tokenizer,
         processor=model.reasoner.processor,
         image_processor=model.observer.processor
     )
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    
+    val_dataset = GroundingDataset(
+        data_list=val_data,
+        image_dir="/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train",
+        tokenizer=model.reasoner.tokenizer,
+        processor=model.reasoner.processor,
+        image_processor=model.observer.processor
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=custom_collate)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, collate_fn=custom_collate)
 
     # 3. Optimizer
-    # Only optimize Bridge and LoRA parameters
     params_to_optimize = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params_to_optimize, lr=1e-4)
 
     # 4. Training Loop
-    model.train()
-    num_epochs = 15
-    save_every = 5 # Save every 5 epochs
+    num_epochs = 3
+    best_iou = 0.0
     
-    # Create a unique run directory
-    base_checkpoints_dir = "/nuvodata/User_data/shiva/Grounding-Jepa/checkpoints"
-    os.makedirs(base_checkpoints_dir, exist_ok=True)
-    run_idx = 1
-    while os.path.exists(os.path.join(base_checkpoints_dir, f"train{run_idx}")):
-        run_idx += 1
-    run_dir = os.path.join(base_checkpoints_dir, f"train{run_idx}")
+    run_dir = "/nuvodata/User_data/shiva/Grounding-Jepa/checkpoints/clinical_run_1"
     os.makedirs(run_dir, exist_ok=True)
-    print(f"Starting training run: {run_dir}")
 
     for epoch in range(num_epochs):
-        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        model.train()
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         epoch_loss = 0
+        
         for batch in loop:
             optimizer.zero_grad()
-            
             images = batch['images'].to(device, dtype=torch.bfloat16)
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             image_grid_thw = batch['image_grid_thw'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs = model(
-                images=images,
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            outputs = model(images=images, input_ids=input_ids, image_grid_thw=image_grid_thw, attention_mask=attention_mask, labels=labels)
             
             loss = outputs.loss
             loss.backward()
@@ -201,26 +238,39 @@ def train():
             
             epoch_loss += loss.item()
             loop.set_postfix(loss=loss.item())
+            wandb.log({"train_loss": loss.item()})
 
-        avg_loss = epoch_loss/len(dataloader)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss}")
+        avg_loss = epoch_loss/len(train_loader)
+        
+        # Validation
+        val_metrics = evaluate(model, val_loader, device, max_samples=250)
+        print(f"Epoch {epoch+1} Val Metrics: {val_metrics}")
+        wandb.log({
+            "val_avg_loss": avg_loss,
+            "val_mean_iou": val_metrics['mean_iou'],
+            "val_sensitivity": val_metrics['sensitivity'],
+            "val_specificity": val_metrics['specificity'],
+            "val_tp": val_metrics['tp'],
+            "val_tn": val_metrics['tn'],
+            "epoch": epoch + 1
+        })
 
-        # Periodic Saving
-        if (epoch + 1) % save_every == 0:
-            epoch_save_dir = os.path.join(run_dir, f"epoch_{epoch+1}")
-            os.makedirs(epoch_save_dir, exist_ok=True)
-            torch.save(model.bridge.state_dict(), os.path.join(epoch_save_dir, "bridge.pt"))
-            model.reasoner.model.save_pretrained(os.path.join(epoch_save_dir, "reasoner_lora"))
-            print(f"Saved periodic checkpoint to {epoch_save_dir}")
+        # Save Last
+        last_dir = os.path.join(run_dir, "last")
+        os.makedirs(last_dir, exist_ok=True)
+        torch.save(model.bridge.state_dict(), os.path.join(last_dir, "bridge.pt"))
+        model.reasoner.model.save_pretrained(os.path.join(last_dir, "reasoner_lora"))
 
-    # 5. Save final results
-    final_dir = os.path.join(run_dir, "final")
-    os.makedirs(final_dir, exist_ok=True)
-    # Save the bridge separately
-    torch.save(model.bridge.state_dict(), os.path.join(final_dir, "bridge_final.pt"))
-    # Save the LoRA adapter
-    model.reasoner.model.save_pretrained(os.path.join(final_dir, "reasoner_lora"))
-    print(f"Training complete. Models saved in {final_dir}")
+        # Save Best
+        if val_metrics['mean_iou'] > best_iou:
+            best_iou = val_metrics['mean_iou']
+            best_dir = os.path.join(run_dir, "best")
+            os.makedirs(best_dir, exist_ok=True)
+            torch.save(model.bridge.state_dict(), os.path.join(best_dir, "bridge.pt"))
+            model.reasoner.model.save_pretrained(os.path.join(best_dir, "reasoner_lora"))
+            print(f"New Best mIOU: {best_iou}. Saved to {best_dir}")
+
+    wandb.finish()
 
 if __name__ == "__main__":
     train()

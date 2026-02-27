@@ -9,6 +9,10 @@ checkpoints/
 *.pt
 *.bin
 *.safetensors
+*.out
+*.tar
+*.tar.gz
+*.log
 
 # Data
 Sample_Data/
