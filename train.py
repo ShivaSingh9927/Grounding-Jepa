@@ -4,13 +4,17 @@ import torch
 import random
 import numpy as np
 import wandb
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
-from torchvision import transforms
+import datetime
 from model import GroundingJepa
 from tqdm import tqdm
 from eval_utils import get_clinical_metrics
 
+# --- Dataset and Collate (Keep your existing classes) ---
 class GroundingDataset(Dataset):
     def __init__(self, data_list, image_dir, tokenizer, processor, image_processor):
         self.data = data_list
@@ -26,63 +30,29 @@ class GroundingDataset(Dataset):
         item = self.data[idx]
         img_id = item['image_id']
         img_path = os.path.join(self.image_dir, f"{img_id}.png")
-        
-        # Load image
         try:
             image = Image.open(img_path).convert('RGB')
         except FileNotFoundError:
             image = Image.new('RGB', (224, 224), (0, 0, 0))
-            
-        # Use observer's image processor
         pixel_values = self.image_processor(image, return_tensors="pt").pixel_values.squeeze(0)
-
-        # Extraction logic
-        question = item.get('question', "")
-        answer = item.get('answer', "")
-
-        if not question or not answer:
-            out = item.get('structured_output', {})
-            if 'REC_QUESTION' in out:
-                question = out['REC_QUESTION']
-                answer = out.get('REC_ANSWER', "")
-            elif 'REC QUESTION' in out:
-                question = out['REC QUESTION']
-                answer = out.get('REC ANSWER', out.get('ANSWER', ""))
-            else:
-                question = out.get('QUESTION', "Describe the chest X-ray.")
-                answer = out.get('ANSWER', "The chest X-ray appears normal.")
-
-        question = question.replace("Question: ", "").strip()
-        answer = answer.replace("Answer: ", "").strip()
+        question = item.get('question', "").replace("Question: ", "").strip()
+        answer = item.get('answer', "").replace("Answer: ", "").strip()
+        if not question: question = "Describe the chest X-ray."
         
-        # Training format (Chat template)
         messages = [
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]},
             {"role": "assistant", "content": [{"type": "text", "text": answer}]}
         ]
-        
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        
-        image_for_processor = image.resize((224, 224))
-        
-        inputs = self.processor(
-            text=[prompt],
-            images=[image_for_processor],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=768
-        )
-
-        labels = inputs.input_ids.clone()
-        
+        inputs = self.processor(text=[prompt], images=[image.resize((224, 224))], return_tensors="pt", 
+                                padding="max_length", truncation=True, max_length=768)
         return {
             "images": pixel_values,
             "input_ids": inputs.input_ids.squeeze(0),
             "attention_mask": inputs.attention_mask.squeeze(0),
             "image_grid_thw": inputs.image_grid_thw.squeeze(0),
-            "labels": labels.squeeze(0),
-            "raw_image": image_for_processor, # Keep for visualization if needed
+            "labels": inputs.input_ids.clone().squeeze(0),
+            "raw_image": image.resize((224, 224)),
             "raw_question": question,
             "raw_answer": answer
         }
@@ -97,53 +67,41 @@ def custom_collate(batch):
             collated[key] = [item[key] for item in batch]
     return collated
 
-def evaluate(model, dataloader, device, max_samples=100):
+def setup():
+    # Increase timeout to 2 hours to avoid crashes during evaluation on Rank 0
+    dist.init_process_group("nccl", timeout=datetime.timedelta(hours=2))
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+def cleanup():
+    dist.destroy_process_group()
+
+def evaluate(model, dataloader, device, max_samples=None):
     model.eval()
-    predictions = []
-    ground_truths = []
+    predictions, ground_truths = [], []
+    m_base = model.module if isinstance(model, DDP) else model
     
-    # We limit validation samples for speed during training if desired
-    # For a full epoch end, we use more.
     count = 0
-    print("Running Validation...")
+    total_samples = max_samples if max_samples else len(dataloader.dataset)
+    print(f"Evaluating {total_samples} samples...")
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            if count >= max_samples:
+            if max_samples and count >= max_samples:
                 break
-                
-            images = batch['images'].to(device, dtype=torch.bfloat16)
-            image_grid_thw = batch['image_grid_thw'].to(device)
-            # For generation, we use the reasoning prompt (User only)
             
+            images = batch['images'].to(device, dtype=torch.bfloat16)
             for i in range(len(batch['raw_question'])):
-                if count >= max_samples: break
+                if max_samples and count >= max_samples: break
                 
-                # Single sample inference
-                img = batch['raw_image'][i]
                 prompt = batch['raw_question'][i]
-                gt = batch['raw_answer'][i]
-                
-                # We can call model.predict_grounding directly but we already have pixels
-                # Let's use a optimized version here
-                pixel_values = images[i].unsqueeze(0)
-                grid_thw = image_grid_thw[i].unsqueeze(0)
-                
                 messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
-                gen_prompt = model.reasoner.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                
-                inputs = model.reasoner.processor(text=[gen_prompt], images=[img], return_tensors="pt").to(device)
-                
-                outputs = model.reasoner.generate_answer(
-                    input_ids=inputs.input_ids,
-                    images=pixel_values,
-                    image_grid_thw=grid_thw,
-                    attention_mask=inputs.attention_mask
-                )
-                
-                pred_text = model.reasoner.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                predictions.append(pred_text)
-                ground_truths.append(gt)
+                gen_prompt = m_base.reasoner.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = m_base.reasoner.processor(text=[gen_prompt], images=[batch['raw_image'][i]], return_tensors="pt").to(device)
+                outputs = m_base.reasoner.generate_answer(input_ids=inputs.input_ids, images=images[i].unsqueeze(0), 
+                                                        image_grid_thw=batch['image_grid_thw'][i].to(device).unsqueeze(0), 
+                                                        attention_mask=inputs.attention_mask)
+                predictions.append(m_base.reasoner.tokenizer.decode(outputs[0], skip_special_tokens=True))
+                ground_truths.append(batch['raw_answer'][i])
                 count += 1
                 
     metrics = get_clinical_metrics(predictions, ground_truths)
@@ -151,126 +109,104 @@ def evaluate(model, dataloader, device, max_samples=100):
     return metrics
 
 def train():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    setup()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
     
-    # Initialize W&B
-    wandb.init(project="grounding-jepa-xray", name="clinical-metrics-run-1")
-
-    # 1. Initialize Model
+    # 1. Model Initialization
     model = GroundingJepa(
-        ijepa_model_id='jmtzt/ijepa_vitg16_22k',
-        device=device,
-        freeze_observer=True,
-        use_lora=True,
+        ijepa_model_id='jmtzt/ijepa_vitg16_22k', device=device, freeze_observer=True, use_lora=True,
         jepa_checkpoint_path='/nuvodata/User_data/shiva/Grounding-Jepa/weights/jepa_xray_vitg16.pth.tar'
-    ).to(device)
-    model.to(dtype=torch.bfloat16)
+    ).to(device).to(dtype=torch.bfloat16)
 
-    # 2. Setup Data Split (Image-ID aware)
+    # Gradient Checkpointing fixes
+    model.reasoner.model.gradient_checkpointing_enable()
+    model.reasoner.model.config.use_cache = False # Required for checkpointing
+
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    m_base = model.module
+
+    # 2. Data Setup
     jsonl_path = "/nuvodata/User_data/shiva/Grounding-Jepa/data/medgemma_clean_qa.jsonl"
-    all_data = []
-    with open(jsonl_path, 'r') as f:
-        for line in f:
-            all_data.append(json.loads(line))
-            
-    # Unique IDs
+    all_data = [json.loads(line) for line in open(jsonl_path, 'r')]
     unique_ids = list(set([item['image_id'] for item in all_data]))
     random.seed(42)
     random.shuffle(unique_ids)
-    
     split_idx = int(0.8 * len(unique_ids))
-    train_ids = set(unique_ids[:split_idx])
-    val_ids = set(unique_ids[split_idx:])
-    
-    train_data = [d for d in all_data if d['image_id'] in train_ids]
-    val_data = [d for d in all_data if d['image_id'] in val_ids]
-    
-    print(f"Dataset Split: {len(train_data)} train, {len(val_data)} val ({len(unique_ids)} unique images)")
+    train_data = [d for d in all_data if d['image_id'] in set(unique_ids[:split_idx])]
+    val_data = [d for d in all_data if d['image_id'] in set(unique_ids[split_idx:])]
 
-    train_dataset = GroundingDataset(
-        data_list=train_data,
-        image_dir="/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train",
-        tokenizer=model.reasoner.tokenizer,
-        processor=model.reasoner.processor,
-        image_processor=model.observer.processor
-    )
-    
-    val_dataset = GroundingDataset(
-        data_list=val_data,
-        image_dir="/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train",
-        tokenizer=model.reasoner.tokenizer,
-        processor=model.reasoner.processor,
-        image_processor=model.observer.processor
-    )
+    train_ds = GroundingDataset(train_data, "/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train", 
+                                m_base.reasoner.tokenizer, m_base.reasoner.processor, m_base.observer.processor)
+    val_ds = GroundingDataset(val_data, "/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train", 
+                             m_base.reasoner.tokenizer, m_base.reasoner.processor, m_base.observer.processor)
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=custom_collate)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, collate_fn=custom_collate)
+    train_sampler = DistributedSampler(train_ds, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=6, sampler=train_sampler, collate_fn=custom_collate, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=6, shuffle=True, collate_fn=custom_collate) # Shuffle val for diverse mini-eval
 
-    # 3. Optimizer
-    params_to_optimize = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params_to_optimize, lr=1e-4)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
 
-    # 4. Training Loop
-    num_epochs = 3
     best_iou = 0.0
-    
-    run_dir = "/nuvodata/User_data/shiva/Grounding-Jepa/checkpoints/clinical_run_1"
-    os.makedirs(run_dir, exist_ok=True)
+    if local_rank == 0:
+        wandb.init(project="grounding-jepa-xray", name="ddp-clinical-final")
+        run_dir = "/nuvodata/User_data/shiva/Grounding-Jepa/checkpoints/clinical_run_final"
+        os.makedirs(run_dir, exist_ok=True)
 
-    for epoch in range(num_epochs):
+    # 3. Training Loop
+    accumulation_steps = 4
+    for epoch in range(15):
+        train_sampler.set_epoch(epoch)
         model.train()
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        epoch_loss = 0
+        optimizer.zero_grad()
         
-        for batch in loop:
-            optimizer.zero_grad()
+        for i, batch in enumerate(tqdm(train_loader, disable=(local_rank != 0))):
             images = batch['images'].to(device, dtype=torch.bfloat16)
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            image_grid_thw = batch['image_grid_thw'].to(device)
-            labels = batch['labels'].to(device)
-
-            outputs = model(images=images, input_ids=input_ids, image_grid_thw=image_grid_thw, attention_mask=attention_mask, labels=labels)
+            images.requires_grad_(True) 
             
-            loss = outputs.loss
+            outputs = model(
+                images=images, 
+                input_ids=batch['input_ids'].to(device),
+                attention_mask=batch['attention_mask'].to(device),
+                image_grid_thw=batch['image_grid_thw'].to(device),
+                labels=batch['labels'].to(device)
+            )
+            
+            loss = outputs.loss / accumulation_steps
             loss.backward()
-            optimizer.step()
+
+            if (i + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                if local_rank == 0: wandb.log({"train_loss": loss.item() * accumulation_steps})
+
+        if local_rank == 0:
+            # Clear cache before evaluation to maximize memory for generation
+            torch.cuda.empty_cache()
             
-            epoch_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
-            wandb.log({"train_loss": loss.item()})
+            # We evaluate on a 500-sample subset to keep training efficient
+            metrics = evaluate(model, val_loader, device, max_samples=500)
+            wandb.log({**metrics, "epoch": epoch + 1})
+            
+            # Save Last
+            last_dir = os.path.join(run_dir, "last")
+            os.makedirs(last_dir, exist_ok=True)
+            torch.save(m_base.bridge.state_dict(), os.path.join(last_dir, "bridge.pt"))
+            m_base.reasoner.model.save_pretrained(os.path.join(last_dir, "reasoner_lora"))
 
-        avg_loss = epoch_loss/len(train_loader)
-        
-        # Validation
-        val_metrics = evaluate(model, val_loader, device, max_samples=250)
-        print(f"Epoch {epoch+1} Val Metrics: {val_metrics}")
-        wandb.log({
-            "val_avg_loss": avg_loss,
-            "val_mean_iou": val_metrics['mean_iou'],
-            "val_sensitivity": val_metrics['sensitivity'],
-            "val_specificity": val_metrics['specificity'],
-            "val_tp": val_metrics['tp'],
-            "val_tn": val_metrics['tn'],
-            "epoch": epoch + 1
-        })
+            # Save Best (Based on mean_iou)
+            if metrics['mean_iou'] > best_iou:
+                best_iou = metrics['mean_iou']
+                best_dir = os.path.join(run_dir, "best")
+                os.makedirs(best_dir, exist_ok=True)
+                torch.save(m_base.bridge.state_dict(), os.path.join(best_dir, "bridge.pt"))
+                m_base.reasoner.model.save_pretrained(os.path.join(best_dir, "best_reasoner_lora"))
+                print(f"New Best mIOU: {best_iou:.4f} - Saved to {best_dir}")
 
-        # Save Last
-        last_dir = os.path.join(run_dir, "last")
-        os.makedirs(last_dir, exist_ok=True)
-        torch.save(model.bridge.state_dict(), os.path.join(last_dir, "bridge.pt"))
-        model.reasoner.model.save_pretrained(os.path.join(last_dir, "reasoner_lora"))
+        # Synchronize all ranks before starting the next epoch
+        dist.barrier()
 
-        # Save Best
-        if val_metrics['mean_iou'] > best_iou:
-            best_iou = val_metrics['mean_iou']
-            best_dir = os.path.join(run_dir, "best")
-            os.makedirs(best_dir, exist_ok=True)
-            torch.save(model.bridge.state_dict(), os.path.join(best_dir, "bridge.pt"))
-            model.reasoner.model.save_pretrained(os.path.join(best_dir, "reasoner_lora"))
-            print(f"New Best mIOU: {best_iou}. Saved to {best_dir}")
-
-    wandb.finish()
+    cleanup()
 
 if __name__ == "__main__":
     train()
