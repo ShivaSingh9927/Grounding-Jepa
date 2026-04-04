@@ -16,7 +16,13 @@ class JepaVisionWrapper(nn.Module):
 
     @property
     def dtype(self):
-        return self.bridge.mlp[0].weight.dtype
+        # Get dtype from the first parameter of the bridge
+        if hasattr(self.bridge, 'mlp') and len(self.bridge.mlp) > 0:
+            return self.bridge.mlp[0].weight.dtype
+        elif hasattr(self.bridge, 'q_proj'):
+            return self.bridge.q_proj.weight.dtype
+        else:
+            return next(self.bridge.parameters()).dtype
         
     def forward(self, pixel_values, **kwargs):
         # pixel_values here is [B, 3, 224, 224] from our loader

@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 import datetime
+import argparse
 from model import GroundingJepa
 from tqdm import tqdm
 from eval_utils import get_clinical_metrics
@@ -68,17 +69,23 @@ def custom_collate(batch):
     return collated
 
 def setup():
-    # Increase timeout to 2 hours to avoid crashes during evaluation on Rank 0
-    dist.init_process_group("nccl", timeout=datetime.timedelta(hours=2))
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group("nccl", timeout=datetime.timedelta(hours=2))
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        return True
+    else:
+        torch.cuda.set_device(0)
+        return False
 
-def cleanup():
-    dist.destroy_process_group()
+def cleanup(is_distributed):
+    if is_distributed:
+        dist.destroy_process_group()
 
 def evaluate(model, dataloader, device, max_samples=None):
     model.eval()
     predictions, ground_truths = [], []
-    m_base = model.module if isinstance(model, DDP) else model
+    is_ddp = isinstance(model, DDP)
+    m_base = model.module if is_ddp else model
     
     count = 0
     total_samples = max_samples if max_samples else len(dataloader.dataset)
@@ -108,14 +115,23 @@ def evaluate(model, dataloader, device, max_samples=None):
     model.train()
     return metrics
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Grounding-JEPA")
+    parser.add_argument("--use_rope", action="store_true", help="Enable 2D RoPE in C-Abstractor")
+    parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta value")
+    parser.add_argument("--run_name", type=str, default="ddp-clinical", help="Wandb run name")
+    return parser.parse_args()
+
 def train():
-    setup()
-    local_rank = int(os.environ["LOCAL_RANK"])
+    args = parse_args()
+    is_distributed = setup()
+    local_rank = 0 if not is_distributed else int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     
     # 1. Model Initialization
     model = GroundingJepa(
         ijepa_model_id='jmtzt/ijepa_vitg16_22k', device=device, freeze_observer=True, use_lora=True,
+        use_rope=args.use_rope, rope_theta=args.rope_theta,
         jepa_checkpoint_path='/nuvodata/User_data/shiva/Grounding-Jepa/weights/jepa_xray_vitg16.pth.tar'
     ).to(device).to(dtype=torch.bfloat16)
 
@@ -123,8 +139,11 @@ def train():
     model.reasoner.model.gradient_checkpointing_enable()
     model.reasoner.model.config.use_cache = False # Required for checkpointing
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-    m_base = model.module
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        m_base = model.module
+    else:
+        m_base = model
 
     # 2. Data Setup
     jsonl_path = "/nuvodata/User_data/shiva/Grounding-Jepa/data/medgemma_clean_qa.jsonl"
@@ -141,26 +160,31 @@ def train():
     val_ds = GroundingDataset(val_data, "/weka/kanpur/data_radiovision/paediatric_xray_dataset/physionet.org/png_images/train", 
                              m_base.reasoner.tokenizer, m_base.reasoner.processor, m_base.observer.processor)
 
-    train_sampler = DistributedSampler(train_ds, shuffle=True)
-    train_loader = DataLoader(train_ds, batch_size=6, sampler=train_sampler, collate_fn=custom_collate, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=6, shuffle=True, collate_fn=custom_collate) # Shuffle val for diverse mini-eval
+    if is_distributed:
+        train_sampler = DistributedSampler(train_ds, shuffle=True)
+        train_loader = DataLoader(train_ds, batch_size=6, sampler=train_sampler, collate_fn=custom_collate, num_workers=4, pin_memory=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=6, shuffle=True, collate_fn=custom_collate, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=6, shuffle=True, collate_fn=custom_collate)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
 
     best_iou = 0.0
     if local_rank == 0:
-        wandb.init(project="grounding-jepa-xray", name="ddp-clinical-final")
+        run_suffix = "_rope" if args.use_rope else "_baseline"
+        wandb.init(project="grounding-jepa-xray", name=args.run_name + run_suffix)
         run_dir = "/nuvodata/User_data/shiva/Grounding-Jepa/checkpoints/clinical_run_final"
         os.makedirs(run_dir, exist_ok=True)
 
     # 3. Training Loop
     accumulation_steps = 4
     for epoch in range(15):
-        train_sampler.set_epoch(epoch)
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad()
         
-        for i, batch in enumerate(tqdm(train_loader, disable=(local_rank != 0))):
+        for i, batch in enumerate(tqdm(train_loader, disable=(is_distributed and local_rank != 0))):
             images = batch['images'].to(device, dtype=torch.bfloat16)
             images.requires_grad_(True) 
             
@@ -178,7 +202,7 @@ def train():
             if (i + 1) % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
-                if local_rank == 0: wandb.log({"train_loss": loss.item() * accumulation_steps})
+                if (not is_distributed or local_rank == 0): wandb.log({"train_loss": loss.item() * accumulation_steps})
 
         if local_rank == 0:
             # Clear cache before evaluation to maximize memory for generation
@@ -203,10 +227,10 @@ def train():
                 m_base.reasoner.model.save_pretrained(os.path.join(best_dir, "best_reasoner_lora"))
                 print(f"New Best mIOU: {best_iou:.4f} - Saved to {best_dir}")
 
-        # Synchronize all ranks before starting the next epoch
-        dist.barrier()
+        if is_distributed:
+            dist.barrier()
 
-    cleanup()
+    cleanup(is_distributed)
 
 if __name__ == "__main__":
     train()

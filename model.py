@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from modules.observer import IJepaObserver
-from modules.bridge import CAbstractor
+from modules.bridge import CAbstractor, CAbstractorWithFinalProj
 from modules.reasoner import QwenReasoner
 
 class GroundingJepa(nn.Module):
@@ -18,6 +18,8 @@ class GroundingJepa(nn.Module):
                  device='cuda',
                  freeze_observer=True,
                  use_lora=True,
+                 use_rope=False,
+                 rope_theta=10000.0,
                  jepa_checkpoint_path=None):
         super().__init__()
         
@@ -31,7 +33,14 @@ class GroundingJepa(nn.Module):
         # 2. The Bridge
         in_dim = self.observer.embed_dim
         out_dim = 3584 # Default for Qwen2.5-7B
-        self.bridge = CAbstractor(in_channels=in_dim, out_channels=out_dim)
+        self.bridge = CAbstractorWithFinalProj(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            use_rope=use_rope,
+            rope_theta=rope_theta
+        )
+        if use_rope:
+            print(f"RoPE enabled in Bridge (theta={rope_theta})")
         
         # 3. The Reasoner
         self.reasoner = QwenReasoner(model_id=qwen_model_id, device=device)

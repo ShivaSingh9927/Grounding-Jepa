@@ -1,0 +1,109 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            6013ilchdna4rdbgkefitik4caa7sp75:
+                args:
+                    - --use_rope
+                    - --run_name
+                    - my_run
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 112
+                cpu_count_logical: 224
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "3776651378688"
+                        used: "937242066944"
+                email: shivasinghjadon1924@gmail.com
+                executable: /nuvodata/User_data/shiva/anaconda3/envs/ptca/bin/python
+                git:
+                    commit: b0742dead803fcfa9319892fcf89201285335ee9
+                    remote: git@github.com:ShivaSingh9927/Grounding-Jepa.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-3b936c27-7029-3c46-5f2d-a3fb002db08d
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-1d571a91-6ac2-aad9-3a45-21cb2a397985
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-fc295e39-c545-26a6-0c9a-43ebaa00d685
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-429e3f03-d24d-b2a9-873f-38f5344211e8
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-854e01d6-f441-259d-699f-95b053a0f3b1
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-64fe4114-83be-4952-ed02-fb0fa1798ee4
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-164bfd5f-d89b-103c-b96e-58efa7aab1c7
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-897531f7-2728-1833-9baf-a95b4ebf1c75
+                host: neysa-kanpur
+                memory:
+                    total: "2164015185920"
+                os: Linux-6.8.0-86-generic-x86_64-with-glibc2.39
+                program: /nuvodata/User_data/shiva/Grounding-Jepa/train.py
+                python: CPython 3.10.14
+                root: /nuvodata/User_data/shiva/Grounding-Jepa
+                startedAt: "2026-04-04T11:14:24.098863Z"
+                writerId: 6013ilchdna4rdbgkefitik4caa7sp75
+        m: []
+        python_version: 3.10.14
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 63
+                - 71
+                - 98
+                - 105
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 63
+                - 71
+                - 98
+                - 105
+            "3":
+                - 13
+            "4": 3.10.14
+            "5": 0.25.0
+            "6": 4.53.2
+            "8":
+                - 2
+            "12": 0.25.0
+            "13": linux-x86_64
